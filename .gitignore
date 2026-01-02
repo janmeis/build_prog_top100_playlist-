@@ -62,3 +62,5 @@ Thumbs.db
 # Project-specific: logs and playlists
 *-log.txt
 *.m3u8
+# Index caches
+*.tmp
