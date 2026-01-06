@@ -58,14 +58,67 @@ def dest_album_dirname(artist: str, year: Optional[str], album: str) -> str:
     return sanitize_component(f"{artist} - {y} - {album}")
 
 def parse_m3u8_tracks(playlist_path: Path) -> List[Path]:
+    # Resolve relative track paths against the playlist's directory.
+    # This prevents accidental interpretation relative to the current working dir
+    # and eliminates spurious entries like '.' mapping to "- Unknown -".
     tracks: List[Path] = []
+    base = playlist_path.parent
     with playlist_path.open('r', encoding='utf-8', errors='ignore') as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            # Treat raw path lines as Windows/UNC paths
-            tracks.append(Path(line))
+            # Ignore control-like entries that denote the current directory
+            norm = line.replace('\\', '/').strip()
+            if norm in {'.', './'}:
+                continue
+            # If line looks like a bare folder (ends with slash), skip it
+            if norm.endswith('/'):
+                continue
+            p = Path(line)
+            # Absolute paths (including UNC) are kept as-is; otherwise, make them
+            # relative to the playlist folder to match how media players write M3U8s.
+            if not p.is_absolute():
+                p = (base / line).expanduser()
+                try:
+                    p = p.resolve()
+                except Exception:
+                    # Nonexistent paths still fine for logging/dry-run; keep joined path
+                    pass
+            # If the resulting path's filename starts with a '#', it's likely a control
+            # line (e.g., base path accidentally prefixed to '#EXTM3U' or '#EXTINF').
+            # Skip such entries to avoid treating the share root as an album.
+            try:
+                if p.name.startswith('#'):
+                    continue
+            except Exception:
+                pass
+            # Early string compare to skip the playlist base folder entry
+            if str(p).rstrip('/\\').casefold() == str(base).rstrip('/\\').casefold():
+                continue
+            # If the resolved path equals the playlist folder itself, skip it
+            try:
+                if p.resolve() == base.resolve():
+                    continue
+            except Exception:
+                # If resolve fails, best-effort case-insensitive compare without trailing slashes
+                def _norm_path_str(x: Path) -> str:
+                    return str(x).rstrip('/\\').casefold()
+                if _norm_path_str(p) == _norm_path_str(base):
+                    continue
+            # Skip directory markers; M3U8s list files, we derive album via parent
+            try:
+                if p.is_dir():
+                    continue
+            except Exception:
+                pass
+            # Skip playlist files themselves (.m3u/.m3u8) if they appear as entries
+            try:
+                if p.suffix.lower() in {'.m3u', '.m3u8'}:
+                    continue
+            except Exception:
+                pass
+            tracks.append(p)
     return tracks
 
 def unique_album_folders_from_tracks(tracks: List[Path]) -> List[Path]:
@@ -116,17 +169,26 @@ def ensure_dir(path: Path):
 
 def setup_logger(log_path: Path):
     ensure_dir(log_path.parent)
+    # Start fresh each run: delete existing log file if present
+    try:
+        if log_path.exists():
+            log_path.unlink()
+    except Exception:
+        # If deletion fails, FileHandler(mode='w') will still truncate
+        pass
+
     logging.basicConfig(
         level=logging.INFO,
         format='[%(levelname)s] %(message)s',
         handlers=[
-            logging.FileHandler(log_path, encoding='utf-8'),
+            logging.FileHandler(log_path, mode='w', encoding='utf-8'),
             logging.StreamHandler()
-        ]
+        ],
+        force=True
     )
 
 
-def sync_albums(playlist_path: Path, dest_root: Path, apply: bool, log_path: Optional[Path] = None):
+def sync_albums(playlist_path: Path, dest_root: Path, dry_run: bool, log_path: Optional[Path] = None):
     # Default log next to playlist
     if log_path is None:
         log_path = playlist_path.with_name(playlist_path.stem + '-copy-log.txt')
@@ -134,7 +196,8 @@ def sync_albums(playlist_path: Path, dest_root: Path, apply: bool, log_path: Opt
 
     logging.info(f"Playlist: {playlist_path}")
     logging.info(f"Destination: {dest_root}")
-    logging.info(f"Mode: {'APPLY' if apply else 'DRY-RUN'}")
+    if dry_run:
+        logging.info("Mode: DRY-RUN")
     logging.info("Omitting '.temp' folders from sync scope")
 
     tracks = parse_m3u8_tracks(playlist_path)
@@ -144,9 +207,27 @@ def sync_albums(playlist_path: Path, dest_root: Path, apply: bool, log_path: Opt
     logging.info(f"Unique album folders: {len(album_dirs)}")
 
     desired_map: Dict[str, Path] = {}
+    base = playlist_path.parent
     for album in album_dirs:
+        # Ensure album folder is under an artist directory, not directly under base
+        try:
+            rel = album.resolve().relative_to(base.resolve())
+            if len(rel.parts) < 2:
+                logging.debug(f"Skip album folder directly under base (no artist dir): {album}")
+                continue
+        except Exception:
+            # If relative_to fails, proceed with best effort
+            pass
         artist, year, title = extract_album_info(album)
+        # Guard against invalid/empty artist or album names
+        if not artist.strip() or not title.strip():
+            logging.info(f"Skip invalid album folder (empty artist/album): {album}")
+            continue
         dest_name = dest_album_dirname(artist, year, title)
+        # Hard block: never create the special '- Unknown -' folder
+        if dest_name.strip().lower() == '- unknown -':
+            logging.info(f"Skip invalid mapping to '- Unknown -': {album}")
+            continue
         if dest_name in desired_map:
             # Prefer first occurrence; skip duplicates
             continue
@@ -164,14 +245,14 @@ def sync_albums(playlist_path: Path, dest_root: Path, apply: bool, log_path: Opt
     for name in to_copy:
         src = desired_map[name]
         dest_dir = dest_root / name
-        if apply:
+        if not dry_run:
             ensure_dir(dest_dir)
         # Collect files
         files = iter_source_files(src)
-        logging.info(f"Copy {src} -> {dest_dir} ({len(files)} files){' [APPLY]' if apply else ' [DRY-RUN]'}")
+        logging.info(f"Copy {src} -> {dest_dir} ({len(files)} files){' [DRY-RUN]' if dry_run else ''}")
         for sf in files:
             df = dest_dir / sanitize_component(sf.name)
-            if apply:
+            if not dry_run:
                 # Handle collision: skip if exists with same size; else overwrite
                 if df.exists():
                     try:
@@ -187,7 +268,7 @@ def sync_albums(playlist_path: Path, dest_root: Path, apply: bool, log_path: Opt
             else:
                 # Dry-run log only
                 pass
-        if apply:
+        if not dry_run:
             copied_count += 1
 
     # Delete phase
@@ -198,8 +279,8 @@ def sync_albums(playlist_path: Path, dest_root: Path, apply: bool, log_path: Opt
         if name.lower() in PROTECTED_DIRS:
             logging.info(f"Skip protected folder (no delete): {obsolete_dir}")
             continue
-        logging.info(f"Delete {obsolete_dir}{' [APPLY]' if apply else ' [DRY-RUN]'}")
-        if apply and obsolete_dir.exists():
+        logging.info(f"Delete {obsolete_dir}{' [DRY-RUN]' if dry_run else ''}")
+        if not dry_run and obsolete_dir.exists():
             try:
                 shutil.rmtree(obsolete_dir)
                 deleted_count += 1
@@ -216,21 +297,21 @@ def main():
     parser = argparse.ArgumentParser(description='Sync album folders from an M3U8 playlist to a flat destination (Artist - Year - Album).')
     parser.add_argument('--playlist', required=True, help='Path to .m3u8 playlist.')
     parser.add_argument('--dest', required=True, help='Destination directory for synced albums (e.g., E:\\).')
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('--apply', action='store_true', help='Apply changes (copy/delete).')
-    group.add_argument('--dry-run', action='store_true', help='Dry-run only (default).')
+    parser.add_argument('--dry-run', action='store_true', help='Dry-run only (no changes performed). Omit to apply changes.')
     parser.add_argument('--log', help='Optional log file path; defaults next to playlist.')
 
     args = parser.parse_args()
-    # Default to dry-run if neither flag given
-    if not args.apply and not args.dry_run:
-        args.dry_run = True
 
     playlist = Path(args.playlist)
     dest = Path(args.dest)
     log = Path(args.log) if args.log else None
 
-    sync_albums(playlist, dest, apply=(not args.dry_run), log_path=log)
+    sync_albums(playlist, dest, dry_run=args.dry_run, log_path=log)
+    # Ensure all log handlers flush/close to avoid empty log files
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':
